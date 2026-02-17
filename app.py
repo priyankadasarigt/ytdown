@@ -3,6 +3,7 @@ from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 import yt_dlp
 import os
+import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
@@ -11,6 +12,19 @@ import secrets
 import boto3
 from functools import wraps
 import base64
+
+# Auto-update yt-dlp on startup so signature extraction is always current
+def _update_ytdlp():
+    try:
+        result = subprocess.run(
+            ["pip", "install", "--upgrade", "--quiet", "yt-dlp[default]"],
+            capture_output=True, text=True, timeout=60
+        )
+        print(f"[startup] yt-dlp updated: {result.stdout.strip() or 'already latest'}")
+    except Exception as e:
+        print(f"[startup] yt-dlp update skipped: {e}")
+
+threading.Thread(target=_update_ytdlp, daemon=True).start()
 
 app = Flask(__name__)
 
