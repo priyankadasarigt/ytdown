@@ -1,7 +1,8 @@
 Flask==3.0.0
 flask-socketio==5.3.5
 flask-cors==4.0.0
-yt-dlp[default]
+yt-dlp
+yt-dlp-ejs
 python-socketio==5.11.0
 eventlet==0.35.2
 gunicorn==21.2.0
