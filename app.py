@@ -13,11 +13,11 @@ import boto3
 from functools import wraps
 import base64
 
-# Auto-update yt-dlp on startup so signature extraction is always current
+# Auto-update yt-dlp on startup
 def _update_ytdlp():
     try:
         result = subprocess.run(
-            ["pip", "install", "--upgrade", "--quiet", "yt-dlp[default]"],
+            ["pip", "install", "--upgrade", "--quiet", "yt-dlp", "yt-dlp-ejs"],
             capture_output=True, text=True, timeout=60
         )
         print(f"[startup] yt-dlp updated: {result.stdout.strip() or 'already latest'}")
@@ -28,36 +28,21 @@ threading.Thread(target=_update_ytdlp, daemon=True).start()
 
 app = Flask(__name__)
 
-# Load from environment variables
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'change-this-in-production')
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://theyt.pages.dev')
 
-# R2 Credentials (get these from Cloudflare dashboard)
 R2_ACCOUNT_ID = os.environ.get('R2_ACCOUNT_ID')
 R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID')
 R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY')
 R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
 R2_PUBLIC_URL = os.environ.get('R2_PUBLIC_URL', 'https://storage.shriya.workers.dev')
 
-# ─── Cookie support ────────────────────────────────────────────────────────────
-# Three ways to supply cookies (checked in order):
-#
-#   1. COOKIE_BASE64 env var  →  base64-encoded contents of a cookies.txt file
-#      (easiest for Koyeb – paste the base64 string in env vars)
-#
-#   2. COOKIE_FILE env var  →  filesystem path to a cookies.txt already on disk
-#      (useful if baked into a Docker image)
-#
-#   3. POST /api/upload_cookies at runtime  →  upload the file via the API
-#      (protected by ADMIN_SECRET env var)
-#
 COOKIE_FILE_ENV = os.environ.get('COOKIE_FILE', '')
 COOKIE_BASE64_ENV = os.environ.get('COOKIE_BASE64', '')
 COOKIE_RUNTIME_PATH = '/tmp/yt_cookies.txt'
 
 
 def _write_cookie_file_from_base64():
-    """Decode COOKIE_BASE64 env var and write to COOKIE_RUNTIME_PATH at startup."""
     if COOKIE_BASE64_ENV:
         try:
             decoded = base64.b64decode(COOKIE_BASE64_ENV).decode('utf-8')
@@ -72,7 +57,6 @@ _write_cookie_file_from_base64()
 
 
 def get_cookie_file():
-    """Return the best available cookie file path, or None."""
     if os.path.exists(COOKIE_RUNTIME_PATH) and os.path.getsize(COOKIE_RUNTIME_PATH) > 10:
         return COOKIE_RUNTIME_PATH
     if COOKIE_FILE_ENV and os.path.exists(COOKIE_FILE_ENV):
@@ -80,16 +64,7 @@ def get_cookie_file():
     return None
 
 
-# ─── Bot-bypass yt-dlp options ─────────────────────────────────────────────────
 def get_ydl_base_opts():
-    """
-    Base yt-dlp options with bot-detection mitigations:
-      - Prefer android/ios player clients (less aggressive bot checks)
-      - Realistic browser User-Agent
-      - Exponential back-off retries
-      - Node.js runtime for JS extraction
-      - Cookie file injected when available
-    """
     opts = {
         'http_headers': {
             'User-Agent': (
@@ -98,17 +73,15 @@ def get_ydl_base_opts():
                 'Chrome/125.0.0.0 Safari/537.36'
             ),
             'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': (
-                'text/html,application/xhtml+xml,application/xml;'
-                'q=0.9,image/avif,image/webp,*/*;q=0.8'
-            ),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         },
-        # Android client avoids the harshest bot checks on YouTube
         'extractor_args': {
             'youtube': {
                 'player_client': ['web'],
             }
         },
+        # Enable Node.js as JS runtime for signature solving
+        'js_runtimes': {'node': {}},
         'sleep_interval': 1,
         'max_sleep_interval': 3,
         'retries': 5,
@@ -117,20 +90,16 @@ def get_ydl_base_opts():
         'cachedir': '/tmp/yt_dlp_cache',
     }
 
-
     cookie_file = get_cookie_file()
     if cookie_file:
-        # Validate it looks like Netscape format
         try:
             with open(cookie_file, 'r') as f:
                 first_line = f.readline().strip()
             if 'Netscape' in first_line or first_line.startswith('#'):
                 opts['cookiefile'] = cookie_file
-                size = os.path.getsize(cookie_file)
-                print(f"[yt-dlp] Using cookie file: {cookie_file} ({size} bytes)")
+                print(f"[yt-dlp] Using cookie file: {cookie_file} ({os.path.getsize(cookie_file)} bytes)")
             else:
-                print(f"[yt-dlp] WARNING: Cookie file doesn't look like Netscape format! First line: {first_line[:80]}")
-                print("[yt-dlp] Skipping cookie file — export cookies as Netscape format, not JSON")
+                print(f"[yt-dlp] WARNING: Cookie file not Netscape format, skipping. First line: {first_line[:80]}")
         except Exception as e:
             print(f"[yt-dlp] Could not read cookie file: {e}")
     else:
@@ -139,7 +108,6 @@ def get_ydl_base_opts():
     return opts
 
 
-# Configure CORS
 CORS(app, resources={
     r"/*": {
         "origins": [FRONTEND_URL],
@@ -162,7 +130,6 @@ last_activity_time = time.time()
 downloads_db = {}
 tokens_db = {}
 
-# Initialize R2 client (S3-compatible)
 s3_client = boto3.client(
     's3',
     endpoint_url=f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com',
@@ -225,7 +192,6 @@ def require_token(f):
 
 
 def upload_to_r2_direct(filepath, display_filename, session_id=None):
-    """Upload file to Cloudflare R2 with progress reporting."""
     try:
         file_size = os.path.getsize(filepath)
         file_size_mb = file_size / (1024 * 1024)
@@ -236,18 +202,14 @@ def upload_to_r2_direct(filepath, display_filename, session_id=None):
         clean_filename = clean_filename.replace(' ', '_')
         unique_filename = clean_filename
 
-        # Duplicate check
         try:
             objects = s3_client.list_objects_v2(Bucket=R2_BUCKET_NAME)
             if 'Contents' in objects:
                 for obj in objects['Contents']:
                     if obj['Key'] == unique_filename:
-                        existing_size = obj['Size']
-                        size_diff = abs(existing_size - file_size)
+                        size_diff = abs(obj['Size'] - file_size)
                         if size_diff <= (file_size * 0.01):
-                            download_url = f"{R2_PUBLIC_URL}/download/{obj['Key']}"
-                            print(f"Duplicate found: {obj['Key']}")
-                            return {'download_url': download_url, 'filename': obj['Key'], 'duplicate': True}
+                            return {'download_url': f"{R2_PUBLIC_URL}/download/{obj['Key']}", 'filename': obj['Key'], 'duplicate': True}
                         else:
                             base_name = unique_filename.rsplit('.', 1)[0] if '.' in unique_filename else unique_filename
                             extension = '.' + unique_filename.rsplit('.', 1)[1] if '.' in unique_filename else ''
@@ -292,78 +254,54 @@ def upload_to_r2_direct(filepath, display_filename, session_id=None):
                 last_percent[0] = progress
 
         encoded_filename = base64.b64encode(display_filename.encode('utf-8')).decode('ascii')
-        extra_args = {
-            'Metadata': {
-                'expiry-time': str(int(time.time() * 1000) + (2 * 60 * 60 * 1000)),
-                'original-filename-base64': encoded_filename
-            }
-        }
-
         s3_client.upload_file(
             filepath, R2_BUCKET_NAME, unique_filename,
-            ExtraArgs=extra_args, Callback=progress_callback, Config=config
+            ExtraArgs={'Metadata': {
+                'expiry-time': str(int(time.time() * 1000) + (2 * 60 * 60 * 1000)),
+                'original-filename-base64': encoded_filename
+            }},
+            Callback=progress_callback,
+            Config=config
         )
 
-        download_url = f"{R2_PUBLIC_URL}/download/{unique_filename}"
         print(f"Upload completed: {unique_filename}")
-        return {'download_url': download_url, 'filename': unique_filename, 'duplicate': False}
+        return {'download_url': f"{R2_PUBLIC_URL}/download/{unique_filename}", 'filename': unique_filename, 'duplicate': False}
 
     except Exception as e:
         raise Exception(f"R2 upload error: {str(e)}")
 
 
-# ─── Cookie management endpoints ───────────────────────────────────────────────
 @app.route('/api/upload_cookies', methods=['POST', 'OPTIONS'])
 def upload_cookies():
-    """
-    Upload a cookies.txt at runtime.
-    Accepts:
-      • multipart/form-data  →  field name 'cookies'
-      • JSON  →  { "cookies_b64": "<base64 string>" }
-    Protected by ADMIN_SECRET env var (send as X-Admin-Secret header).
-    If ADMIN_SECRET is not set, the endpoint is unprotected (not recommended for prod).
-    """
     if request.method == 'OPTIONS':
         return '', 204
-
     admin_secret = os.environ.get('ADMIN_SECRET', '')
     if admin_secret:
         if request.headers.get('X-Admin-Secret', '') != admin_secret:
             return jsonify({'error': 'Unauthorized'}), 401
-
     try:
         if 'cookies' in request.files:
             content = request.files['cookies'].read().decode('utf-8')
         elif request.is_json:
-            b64 = request.get_json().get('cookies_b64', '')
-            content = base64.b64decode(b64).decode('utf-8')
+            content = base64.b64decode(request.get_json().get('cookies_b64', '')).decode('utf-8')
         else:
             return jsonify({'error': 'No cookie data provided'}), 400
-
         with open(COOKIE_RUNTIME_PATH, 'w') as f:
             f.write(content)
-
         lines = [l for l in content.splitlines() if l.strip() and not l.startswith('#')]
-        return jsonify({
-            'success': True,
-            'message': f'Cookie file saved ({len(lines)} entries)',
-            'path': COOKIE_RUNTIME_PATH
-        })
+        return jsonify({'success': True, 'message': f'Cookie file saved ({len(lines)} entries)'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/cookie_status', methods=['GET'])
 def cookie_status():
-    """Check whether a cookie file is active."""
     cookie_file = get_cookie_file()
     if cookie_file:
-        return jsonify({'active': True, 'path': cookie_file,
-                        'size_bytes': os.path.getsize(cookie_file)})
+        return jsonify({'active': True, 'path': cookie_file, 'size_bytes': os.path.getsize(cookie_file)})
     return jsonify({'active': False})
 
 
-# ─── Socket events ─────────────────────────────────────────────────────────────
 @socketio.on('connect')
 def handle_connect():
     update_activity()
@@ -384,7 +322,6 @@ def error_handler(e):
     return None
 
 
-# ─── HTTP routes ───────────────────────────────────────────────────────────────
 @app.route('/')
 def root():
     return jsonify({'status': 'online'})
@@ -404,25 +341,20 @@ def health():
 def request_token():
     if request.method == 'OPTIONS':
         return '', 204
-
     try:
         update_activity()
         cleanup_expired_tokens()
         cleanup_old_downloads()
-
         client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
         current_time = time.time()
         ip_tokens = [t for t, data in tokens_db.items()
                      if data.get('ip') == client_ip and current_time - data['created_at'] < 3600]
-
         if len(ip_tokens) >= 10:
             return jsonify({'error': 'Rate limit exceeded. Try again later.'}), 429
-
         token = generate_token()
         tokens_db[token] = {'created_at': time.time(), 'used': False, 'ip': client_ip}
         print(f"Generated token for IP {client_ip}")
         return jsonify({'success': True, 'token': token, 'expires_in': 300})
-
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -432,12 +364,10 @@ def request_token():
 def fetch_formats():
     if request.method == 'OPTIONS':
         return '', 204
-
     try:
         update_activity()
         data = request.get_json()
         url = data.get('url')
-
         if not url:
             return jsonify({'error': 'URL is required'}), 400
 
@@ -448,7 +378,6 @@ def fetch_formats():
             info = ydl.extract_info(url, download=False)
             formats = info.get('formats', [])
             title = info.get('title', 'video')
-
             video_formats = {}
             audio_formats = []
 
@@ -547,9 +476,7 @@ def handle_download(data):
             'outtmpl': output_template,
             'progress_hooks': [progress_hook],
             'merge_output_format': 'mp4',
-            'postprocessor_args': {
-                'ffmpeg': ['-c:v', 'copy', '-c:a', 'copy']
-            },
+            'postprocessor_args': {'ffmpeg': ['-c:v', 'copy', '-c:a', 'copy']},
         })
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -575,25 +502,20 @@ def handle_download(data):
                     try:
                         result = upload_to_r2_direct(filepath, display_filename, session_id)
                         os.remove(filepath)
-
-                        download_url = result.get('download_url')
                         print(f"{'Reused duplicate' if result.get('duplicate') else 'Uploaded'}: {actual_file}")
-
                         downloads_db[download_id] = {
-                            'download_url': download_url,
+                            'download_url': result.get('download_url'),
                             'display_filename': display_filename,
                             'title': info['title'],
                             'timestamp': datetime.now()
                         }
-
                         socketio.emit('download_complete', {
                             'session_id': session_id,
                             'download_id': download_id,
                             'filename': display_filename,
-                            'download_url': download_url
+                            'download_url': result.get('download_url')
                         })
                         update_activity()
-
                     except Exception as upload_error:
                         print(f"R2 upload error: {upload_error}")
                         downloads_db[download_id] = {
@@ -610,9 +532,7 @@ def handle_download(data):
                             'fallback': True
                         })
 
-                upload_thread = threading.Thread(target=upload_to_r2)
-                upload_thread.daemon = True
-                upload_thread.start()
+                threading.Thread(target=upload_to_r2, daemon=True).start()
             else:
                 emit('download_error', {'error': 'File not found after download'})
 
