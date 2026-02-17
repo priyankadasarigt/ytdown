@@ -106,7 +106,7 @@ def get_ydl_base_opts():
         # Android client avoids the harshest bot checks on YouTube
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web'],
+                'player_client': ['web'],
             }
         },
         'sleep_interval': 1,
