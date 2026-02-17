@@ -4,13 +4,16 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates ffmpeg && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
+    node --version && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    python -c "import yt_dlp; print('yt-dlp OK')" && \
+    python -c "import yt_dlp_ejs; print('yt-dlp-ejs OK')"
 
 COPY . .
 
